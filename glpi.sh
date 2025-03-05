@@ -1,156 +1,245 @@
 #!/bin/bash
+#
+# GLPI install script
+#
+# Author: jr0w3
+# Version: 1.1.1
+#
 
-set -e
-
-# --- Configuration ---
-DB_NAME="glpi_db"
-DB_USER="glpi"
-DB_PASS=$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c13)
-
-GLPI_DIR="/opt/glpi"
-GLPI_CONF_DIR="/etc/glpi"
-GLPI_FILES_DIR="/var/lib/glpi"
-GLPI_LOG_DIR="/var/log/glpi"
-
-# --- Fonctions Utilitaires ---
-msg_info() { echo -e "\e[94m[INFO]\e[0m $1"; }
-msg_ok() { echo -e "\e[92m[OK]\e[0m $1"; }
-msg_error() { echo -e "\e[91m[ERREUR]\e[0m $1"; exit 1; }
-
-run_cmd() {
-    "$@"
-    if [ $? -ne 0 ]; then
-        msg_error "La commande suivante a échoué : $*"
-    fi
+function warn(){
+    echo -e '\e[31m'$1'\e[0m';
+}
+function info(){
+    echo -e '\e[36m'$1'\e[0m';
 }
 
-cleanup() {
-    rm -rf /opt/glpi-*.tgz
-    apt-get -y autoremove
-    apt-get -y autoclean
+function check_root()
+{
+if [[ "$(id -u)" -ne 0 ]]
+then
+        warn "This script must be run as root" >&2
+        exit 1
+else
+        info "Root privilege: OK"
+fi
 }
 
-trap cleanup EXIT
+function check_distro()
+{
+DEBIAN_VERSIONS=("11" "12")
+UBUNTU_VERSIONS=("22.04")
 
-# --- Installation des dépendances ---
-msg_info "Installation des dépendances"
-run_cmd apt-get update
-run_cmd apt-get install -y curl git sudo mc apache2 \
-    php8.2-{apcu,cli,common,curl,gd,imap,ldap,mysql,xmlrpc,xml,mbstring,bcmath,intl,zip,redis,bz2,soap} \
-    php-cas libapache2-mod-php mariadb-server
-msg_ok "Dépendances installées"
+DISTRO=$(lsb_release -is)
+VERSION=$(lsb_release -rs)
 
-# --- Configuration de la base de données ---
-msg_info "Configuration de la base de données"
+if [ "$DISTRO" == "Debian" ]; then
+        if [[ " ${DEBIAN_VERSIONS[*]} " == *" $VERSION "* ]]; then
+                info "Your operating system version ($DISTRO $VERSION) is compatible."
+        else
+                warn "Your operating system version ($DISTRO $VERSION) is not noted as compatible."
+                warn "Do you still want to force the installation? Be careful, if you choose to force the script, it is at your own risk."
+                info "Are you sure you want to continue? [yes/no]"
+                read response
+                if [ "$response" == "yes" ]; then
+                info "Continuing..."
+                elif [ "$response" == "no" ]; then
+                info "Exiting..."
+                exit 1
+                else
+                warn "Invalid response. Exiting..."
+                exit 1
+                fi
+        fi
+elif [ "$DISTRO" == "Ubuntu" ]; then
+        if [[ " ${UBUNTU_VERSIONS[*]} " == *" $VERSION "* ]]; then
+                info "Your operating system version ($DISTRO $VERSION) is compatible."
+        else
+                warn "Your operating system version ($DISTRO $VERSION) is not noted as compatible."
+                warn "Do you still want to force the installation? Be careful, if you choose to force the script, it is at your own risk."
+                info "Are you sure you want to continue? [yes/no]"
+                read response
+                if [ "$response" == "yes" ]; then
+                info "Continuing..."
+                elif [ "$response" == "no" ]; then
+                info "Exiting..."
+                exit 1
+                else
+                warn "Invalid response. Exiting..."
+                exit 1
+                fi
+        fi
+else
+        warn "Il s'agit d'une autre distribution que Debian ou Ubuntu qui n'est pas compatible."
+        exit 1
+fi
+}
+
+function network_info()
+{
+INTERFACE=$(ip route | awk 'NR==1 {print $5}')
+IPADRESS=$(ip addr show $INTERFACE | grep inet | awk '{ print $2; }' | sed 's/\/.*$//' | head -n 1)
+HOST=$(hostname)
+}
+
+function confirm_installation()
+{
+warn "This script will now install the necessary packages for installing and configuring GLPI."
+info "Are you sure you want to continue? [yes/no]"
+read confirm
+if [ "$confirm" == "yes" ]; then
+        info "Continuing..."
+elif [ "$confirm" == "no" ]; then
+        info "Exiting..."
+        exit 1
+else
+        warn "Invalid response. Exiting..."
+        exit 1
+fi
+}
+
+function install_packages()
+{
+info "Installing packages..."
+sleep 1
+apt update
+apt install --yes --no-install-recommends \
+apache2 \
+mariadb-server \
+perl \
+curl \
+jq \
+php
+info "Installing php extensions..."
+apt install --yes --no-install-recommends \
+php-ldap \
+php-imap \
+php-apcu \
+php-xmlrpc \
+php-cas \
+php-mysqli \
+php-mbstring \
+php-curl \
+php-gd \
+php-simplexml \
+php-xml \
+php-intl \
+php-zip \
+php-bz2
+systemctl enable mariadb
+systemctl enable apache2
+}
+
+function mariadb_configure()
+{
+info "Configuring MariaDB..."
+sleep 1
+SLQROOTPWD=$(openssl rand -base64 48 | cut -c1-12 )
+SQLGLPIPWD=$(openssl rand -base64 48 | cut -c1-12 )
+systemctl start mariadb
+sleep 1
+
+# Remove anonymous user accounts
+mysql -e "DELETE FROM mysql.user WHERE User = ''"
+# Disable remote root login
+mysql -e "DELETE FROM mysql.user WHERE User = 'root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')"
+# Remove the test database
+mysql -e "DROP DATABASE test"
+# Reload privileges
+mysql -e "FLUSH PRIVILEGES"
+# Create a new database
+mysql -e "CREATE DATABASE glpi"
+# Create a new user
+mysql -e "CREATE USER 'glpi_user'@'localhost' IDENTIFIED BY '$SQLGLPIPWD'"
+# Grant privileges to the new user for the new database
+mysql -e "GRANT ALL PRIVILEGES ON glpi.* TO 'glpi_user'@'localhost'"
+# Reload privileges
+mysql -e "FLUSH PRIVILEGES"
+
+# Initialize time zones datas
 mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql mysql
-run_cmd mysql -u root -e "CREATE DATABASE $DB_NAME;"
-run_cmd mysql -u root -e "CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
-run_cmd mysql -u root -e "GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';"
-run_cmd mysql -u root -e "GRANT SELECT ON \`mysql\`.\`time_zone_name\` TO '$DB_USER'@'localhost';"
-run_cmd mysql -u root -e "FLUSH PRIVILEGES;"
-
-cat <<EOF >~/glpi_db.creds
-GLPI Database Credentials
-Database: $DB_NAME
-Username: $DB_USER
-Password: $DB_PASS
-EOF
-chmod 600 ~/glpi_db.creds
-msg_ok "Base de données configurée"
-
-# --- Installation de GLPi ---
-msg_info "Téléchargement et installation de GLPi"
-cd /opt
-RELEASE=$(curl -s https://api.github.com/repos/glpi-project/glpi/releases/latest | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
-wget -q "https://github.com/glpi-project/glpi/releases/download/${RELEASE}/glpi-${RELEASE}.tgz"
-run_cmd tar -xzf glpi-${RELEASE}.tgz
-cd $GLPI_DIR
-run_cmd php bin/console db:install --db-name=$DB_NAME --db-user=$DB_USER --db-password=$DB_PASS --no-interaction
-echo "$RELEASE" > /opt/glpi_version.txt
-msg_ok "GLPi installé"
-
-# --- Configuration Downstream ---
-msg_info "Configuration downstream"
-cat <<EOF >$GLPI_DIR/inc/downstream.php
-<?php
-define('GLPI_CONFIG_DIR', '/etc/glpi/');
-if (file_exists(GLPI_CONFIG_DIR . '/local_define.php')) {
-    require_once GLPI_CONFIG_DIR . '/local_define.php';
+# Ask tz
+dpkg-reconfigure tzdata
+systemctl restart mariadb
+sleep 1
+mysql -e "GRANT SELECT ON mysql.time_zone_name TO 'glpi_user'@'localhost'"
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$SLQROOTPWD'"
 }
-EOF
 
-mv $GLPI_DIR/config $GLPI_CONF_DIR
-mv $GLPI_DIR/files $GLPI_FILES_DIR
-mv $GLPI_FILES_DIR/_log $GLPI_LOG_DIR
+function install_glpi()
+{
+info "Downloading and installing the latest version of GLPI..."
+DOWNLOADLINK=$(curl -s https://api.github.com/repos/glpi-project/glpi/releases/latest | jq -r '.assets[0].browser_download_url')
+wget -O /tmp/glpi-latest.tgz $DOWNLOADLINK
+tar xzf /tmp/glpi-latest.tgz -C /var/www/html/
+touch /var/www/html/glpi/files/_log/php-errors.log
 
-cat <<EOF >$GLPI_CONF_DIR/local_define.php
-<?php
-define('GLPI_VAR_DIR', '$GLPI_FILES_DIR');
-define('GLPI_LOG_DIR', '$GLPI_LOG_DIR');
-EOF
-msg_ok "Fichiers de configuration déplacés"
+# Add permissions
+chown -R www-data:www-data /var/www/html/glpi
+chmod -R 775 /var/www/html/glpi
 
-# --- Permissions ---
-msg_info "Mise à jour des permissions"
-chown -R root:root $GLPI_DIR
-chown -R www-data:www-data $GLPI_CONF_DIR $GLPI_FILES_DIR $GLPI_LOG_DIR
-find $GLPI_DIR -type f -exec chmod 0644 {} \;
-find $GLPI_DIR -type d -exec chmod 0755 {} \;
-msg_ok "Permissions appliquées"
-
-# --- Configuration Apache ---
-msg_info "Configuration du site Apache"
-cat <<EOF >/etc/apache2/sites-available/glpi.conf
+cat > /etc/apache2/sites-available/000-default.conf << EOF
 <VirtualHost *:80>
-    ServerName localhost
-    DocumentRoot /opt/glpi/public
+       DocumentRoot /var/www/html/glpi/public
+       <Directory /var/www/html/glpi/public>
+                Require all granted
+                RewriteEngine On
+                RewriteCond %{REQUEST_FILENAME} !-f
+                RewriteRule ^(.*)$ index.php [QSA,L]
+        </Directory>
 
-    <Directory /opt/glpi/public>
-        Options -Indexes
-        Require all granted
-        RewriteEngine On
-        RewriteCond %{HTTP:Authorization} ^(.+)$
-        RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
-        RewriteCond %{REQUEST_FILENAME} !-f
-        RewriteRule ^(.*)$ index.php [QSA,L]
-    </Directory>
+        LogLevel warn
+        ErrorLog \${APACHE_LOG_DIR}/error-glpi.log
+        CustomLog \${APACHE_LOG_DIR}/access-glpi.log combined
 
-    ErrorLog \${APACHE_LOG_DIR}/glpi_error.log
-    CustomLog \${APACHE_LOG_DIR}/glpi_access.log combined
 </VirtualHost>
 EOF
 
-run_cmd a2dissite 000-default.conf
-run_cmd a2enmod rewrite
-run_cmd a2ensite glpi.conf
-systemctl reload apache2
-msg_ok "Site Apache configuré"
+# Disable Apache Web Server Signature
+echo "ServerSignature Off" >> /etc/apache2/apache2.conf
+echo "ServerTokens Prod" >> /etc/apache2/apache2.conf
 
-# --- Configuration Cron ---
-msg_info "Configuration du cron"
-cat <<EOF >/etc/cron.d/glpi
-* * * * * www-data php /opt/glpi/front/cron.php
-EOF
-chmod 644 /etc/cron.d/glpi
-msg_ok "Cron configuré"
+# Setup Cron task
+echo "*/2 * * * * www-data /usr/bin/php /var/www/html/glpi/front/cron.php &>/dev/null" >> /etc/cron.d/glpi
 
-# --- Mise à jour des paramètres PHP ---
-msg_info "Mise à jour des paramètres PHP"
-PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
-PHP_INI="/etc/php/$PHP_VERSION/apache2/php.ini"
+a2enmod rewrite && systemctl restart apache2
+}
 
-sed -i 's/^upload_max_filesize = .*/upload_max_filesize = 20M/' $PHP_INI
-sed -i 's/^post_max_size = .*/post_max_size = 20M/' $PHP_INI
-sed -i 's/^max_execution_time = .*/max_execution_time = 60/' $PHP_INI
-sed -i 's/^max_input_vars = .*/max_input_vars = 5000/' $PHP_INI
-sed -i 's/^memory_limit = .*/memory_limit = 256M/' $PHP_INI
-sed -i 's/^;\?session.cookie_httponly\s*=.*/session.cookie_httponly = On/' $PHP_INI
+function setup_db()
+{
+info "Setting up GLPI..."
+cd /var/www/html/glpi
+php bin/console db:install --db-name=glpi --db-user=glpi_user --db-password=$SQLGLPIPWD --no-interaction
+rm -rf /var/www/html/glpi/install
+}
 
-systemctl restart apache2
-msg_ok "Paramètres PHP mis à jour"
+function display_credentials()
+{
+info "=======> GLPI installation details  <======="
+warn "It is important to record this informations. If you lose them, they will be unrecoverable."
+info "==> GLPI:"
+info "Default user accounts are:"
+info "USER       -  PASSWORD       -  ACCESS"
+info "glpi       -  glpi           -  admin account,"
+info "tech       -  tech           -  technical account,"
+info "normal     -  normal         -  normal account,"
+info "post-only  -  postonly       -  post-only account."
+echo ""
+info "You can access GLPI web page from IP or hostname:"
+info "http://$IPADRESS or http://$HOST"
+echo ""
+info "==> Database:"
+info "root password:           $SLQROOTPWD"
+info "glpi_user password:      $SQLGLPIPWD"
+info "GLPI database name:      glpi"
+info "<==========================================>"
+}
 
-msg_info "Nettoyage final"
-cleanup
-msg_ok "Installation terminée"
-
-echo "GLPi est installé. Les identifiants de la base de données sont dans ~/glpi_db.creds"
+check_root
+check_distro
+confirm_installation
+network_info
+install_packages
+mariadb_configure
+install_glpi
+setup_db
+display_credentials
